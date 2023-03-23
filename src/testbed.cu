@@ -790,12 +790,13 @@ void Testbed::imgui() {
 			std::vector<float> mean(n_extra_dims, 0.0f);
 			uint32_t n = m_nerf.training.n_images_for_training;
 			float norm = 1.0f / n;
+			// 根据维度求出所有图片均值
 			for (uint32_t i = 0; i < n; ++i) {
 				for (uint32_t j = 0; j < n_extra_dims; ++j) {
 					mean[j] += m_nerf.training.extra_dims_opt[i].variable()[j] * norm;
 				}
 			}
-
+			// 求协方差矩阵 dims=n_extra_dims * n_extra_dims
 			std::vector<float> cov(n_extra_dims * n_extra_dims, 0.0f);
 			float scale = 0.001f;	// compute scale
 			for (uint32_t i = 0; i < n; ++i) {
@@ -824,7 +825,7 @@ void Testbed::imgui() {
 			for (uint32_t m = 0; m < n_extra_dims; ++m) {
 				tmp[m] = 0.0f;
 				for (uint32_t n = 0; n < n_extra_dims; ++n) {
-					tmp[m] += X[n] * cov[m + n * n_extra_dims];
+					tmp[m] += X[n] * cov[m + n * n_extra_dims]; // X[n]=0,tmp[m]=0?
 				}
 				norm += tmp[m] * tmp[m];
 			}
@@ -1747,7 +1748,7 @@ void Testbed::visualize_nerf_cameras(ImDrawList* list, const mat4& world2proj) {
 		auto current_xform = get_xform_given_rolling_shutter(m_nerf.training.transforms[i], m_nerf.training.dataset.metadata[i].rolling_shutter, vec2{0.5f, 0.5f}, 0.0f);
 		visualize_nerf_camera(list, world2proj, m_nerf.training.dataset.xforms[i].start, aspect, 0x40ffff40);
 		visualize_nerf_camera(list, world2proj, m_nerf.training.dataset.xforms[i].end, aspect, 0x40ffff40);
-		visualize_nerf_camera(list, world2proj, current_xform, aspect, 0x80ffffff);
+		visualize_nerf_camera(list, world2proj, current_xform, aspect, 0x80ffffff); // 白色
 
 		// Visualize near distance
 		add_debug_line(list, world2proj, current_xform[3], current_xform[3] + current_xform[2] * m_nerf.training.near_distance, 0x20ffffff);

@@ -422,7 +422,7 @@ if __name__ == "__main__":
 			input("Detectron2 is not installed. Press enter to install it.")
 			import subprocess
 			package = 'git+https://github.com/facebookresearch/detectron2.git'
-			subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+			subprocess.check_call([sys.executable, "-m", "pip", "install","--user", package])
 			import detectron2
 
 		import torch

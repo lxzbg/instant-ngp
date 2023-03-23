@@ -118,10 +118,10 @@ __global__ void mark_untrained_density_grid(const uint32_t n_elements,  float* _
 			++count;
 			continue;
 		}
-
+		// 遍历grid的8个顶点，检查ray是否穿过，count表示穿过几次
 		for (uint32_t k = 0; k < 8; ++k) {
 			// Only consider voxel corners in front of the camera
-			vec3 dir = normalize(corners[k] - xform[3]);
+			vec3 dir = normalize(corners[k] - xform[3]); // xform[3]表示相机z轴?
 			if (dot(dir, xform[2]) < 1e-4f) {
 				continue;
 			}
@@ -138,14 +138,17 @@ __global__ void mark_untrained_density_grid(const uint32_t n_elements,  float* _
 			}
 		}
 	}
-
+	// (grid_out[i] < 0) != (count < min_count): see or unsee状态不一致，则更新
 	if (clear_visible_voxels || (grid_out[i] < 0) != (count < min_count)) {
 		grid_out[i] = (count >= min_count) ? 0.f : -1.f;
+		// 0.f: see
+		// -1.f: unsee
 	}
 }
 
 __global__ void generate_grid_samples_nerf_uniform(ivec3 res_3d, const uint32_t step, BoundingBox render_aabb, mat3 render_aabb_to_local, BoundingBox train_aabb, NerfPosition* __restrict__ out) {
 	// check grid_in for negative values -> must be negative on output
+	// blockDim={16,8,1}
 	uint32_t x = threadIdx.x + blockIdx.x * blockDim.x;
 	uint32_t y = threadIdx.y + blockIdx.y * blockDim.y;
 	uint32_t z = threadIdx.z + blockIdx.z * blockDim.z;
@@ -153,9 +156,13 @@ __global__ void generate_grid_samples_nerf_uniform(ivec3 res_3d, const uint32_t 
 		return;
 	}
 
+	// 从xyz坐标转index
 	uint32_t i = x + y * res_3d.x + z * res_3d.x * res_3d.y;
+	// 归一化到[0,1]，为什么要-1? 
 	vec3 pos = vec3{(float)x, (float)y, (float)z} / vec3(res_3d - 1);
+	// 归一化的pose转到aabb大小下(aabb可能被动态调整)
 	pos = transpose(render_aabb_to_local) * (pos * (render_aabb.max - render_aabb.min) + render_aabb.min);
+	// pos再转到训练的aabb下
 	out[i] = { warp_position(pos, train_aabb), warp_dt(MIN_CONE_STEPSIZE()) };
 }
 
@@ -183,7 +190,7 @@ __global__ void generate_grid_samples_nerf_uniform_dir(ivec3 res_3d, const uint3
 }
 
 __global__ void generate_grid_samples_nerf_nonuniform(const uint32_t n_elements, default_rng_t rng, const uint32_t step, BoundingBox aabb, const float* __restrict__ grid_in, NerfPosition* __restrict__ out, uint32_t* __restrict__ indices, uint32_t n_cascades, float thresh) {
-	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x; // the global index of a thread
 	if (i >= n_elements) return;
 
 	// 1 random number to select the level, 3 to select the position.
@@ -193,6 +200,10 @@ __global__ void generate_grid_samples_nerf_nonuniform(const uint32_t n_elements,
 	// Select grid cell that has density
 	uint32_t idx;
 	for (uint32_t j = 0; j < 10; ++j) {
+		// below magic number it's a linear congruential generator, which is a form of pseudo-random number generator
+		// this use case distributes the density grid update samples more-or-less uniformly over space (due to the pseudo-random nature),
+		// but ensures good coverage by never visiting a grid cell twice without having visited all other cells (due to the permutation property).
+		// Ref:https://github.com/NVlabs/instant-ngp/issues/123
 		idx = ((i+step*n_elements) * 56924617 + j * 19349663 + 96925573) % NERF_GRID_N_CELLS();
 		idx += level * NERF_GRID_N_CELLS();
 		if (grid_in[idx] > thresh) {
@@ -223,10 +234,11 @@ __global__ void splat_grid_samples_nerf_max_nearest_neighbor(const uint32_t n_el
 	// Uncomment for:   optical thickness of the ~expected step size when the observer is in the middle of the scene
 	uint32_t level = 0;//local_idx / NERF_GRID_N_CELLS();
 
-	float mlp = network_to_density(float(network_output[i]), density_activation);
-	float optical_thickness = mlp * scalbnf(MIN_CONE_STEPSIZE(), level);
+	float mlp = network_to_density(float(network_output[i]), density_activation); // mlp density output，使用exp()
+	float optical_thickness = mlp * scalbnf(MIN_CONE_STEPSIZE(), level); // sqrt(3)/1024*(2^level)，sqrt(3)/1024表示dt，density在grid中的一个单元格上积分? 
 
 	// Positive floats are monotonically ordered when their bit pattern is interpretes as uint.
+	// 利用float转uint特性，实现单调排序，得到max_nearest_neighbor
 	// uint atomicMax is thus perfectly acceptable.
 	atomicMax((uint32_t*)&grid_out[local_idx], __float_as_uint(optical_thickness));
 }
@@ -271,7 +283,7 @@ __global__ void ema_grid_samples_nerf(const uint32_t n_elements,
 	// Basically, we want the grid cell turned on as soon as _ANYTHING_ visible is in there.
 
 	float prev_val = grid_out[i];
-	float val = (prev_val<0.f) ? prev_val : fmaxf(prev_val * decay, importance);
+	float val = (prev_val<0.f) ? prev_val : fmaxf(prev_val * decay, importance); // <0.f不可见继续维持，否则做decay
 	grid_out[i] = val;
 }
 
@@ -282,15 +294,15 @@ __global__ void decay_sharpness_grid_nerf(const uint32_t n_elements, float decay
 }
 
 __global__ void grid_to_bitfield(
-	const uint32_t n_elements,
-	const uint32_t n_nonzero_elements,
+	const uint32_t n_elements, // 最大cascades下，预先分配内存里的girds个数
+	const uint32_t n_nonzero_elements, // 实际场景下，有效grids个数，先使用预分配前段内存
 	const float* __restrict__ grid,
 	uint8_t* __restrict__ grid_bitfield,
 	const float* __restrict__ mean_density_ptr
 ) {
 	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
 	if (i >= n_elements) return;
-	if (i >= n_nonzero_elements) {
+	if (i >= n_nonzero_elements) { // 后半段预分配内存直接置0
 		grid_bitfield[i] = 0;
 		return;
 	}
@@ -298,13 +310,15 @@ __global__ void grid_to_bitfield(
 	uint8_t bits = 0;
 
 	float thresh = std::min(NERF_MIN_OPTICAL_THICKNESS(), *mean_density_ptr);
-
+	
+	// 展开情况下，bits可能同时有写操作，SIMD会不会有问题呢?因为是1byte的操作所以向量化不会出问题?
 	NGP_PRAGMA_UNROLL
 	for (uint8_t j = 0; j < 8; ++j) {
 		bits |= grid[i*8+j] > thresh ? ((uint8_t)1 << j) : 0;
+		// i*8是因为一次处理了8个grid，所以n_elements&n_nonzero_elements传入的时候/8
 	}
 
-	grid_bitfield[i] = bits;
+	grid_bitfield[i] = bits; // 每8grid赋值一次
 }
 
 __global__ void bitfield_max_pool(const uint32_t n_elements,
@@ -312,17 +326,23 @@ __global__ void bitfield_max_pool(const uint32_t n_elements,
 	uint8_t* __restrict__ next_level
 ) {
 	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
-	if (i >= n_elements) return;
+	// i表示prev_level索引，
+	// 因为一次处理8个grids，所以n_elements要/8，
+	// 又因为两层之间相差8个（prev_level中8个被next_level中一个包含），所以n_elements要再/8？
+	if (i >= n_elements) return; 
 
 	uint8_t bits = 0;
 
 	NGP_PRAGMA_UNROLL
+	// 遍历1byte里存储的 8 girds，如果prev_level grid>0，则next_level grid置1，否则置0
 	for (uint8_t j = 0; j < 8; ++j) {
 		// If any bit is set in the previous level, set this
 		// level's bit. (Max pooling.)
-		bits |= prev_level[i*8+j] > 0 ? ((uint8_t)1 << j) : 0;
+		bits |= prev_level[i*8+j] > 0 ? ((uint8_t)1 << j) : 0; // i*8是因为一次处理8个grid
 	}
 
+	// 这里的xyz坐标单位是当前level的grid
+	// tcnn::morton3D_invert(i>>0)返回x方向上在prev_level下的?，因此要加上大grid的偏移128/8
 	uint32_t x = morton3D_invert(i>>0) + NERF_GRIDSIZE()/8;
 	uint32_t y = morton3D_invert(i>>1) + NERF_GRIDSIZE()/8;
 	uint32_t z = morton3D_invert(i>>2) + NERF_GRIDSIZE()/8;
@@ -1467,6 +1487,7 @@ __global__ void init_rays_with_payload_kernel_nerf(
 
 	float t = fmaxf(render_aabb.ray_intersect(render_aabb_to_local * ray.o, render_aabb_to_local * ray.d).x, 0.0f) + 1e-6f;
 
+	// 求ray与aabb交点(最远端交点)后，为什么还要做aabb出界判断?什么情况会出界?
 	if (!render_aabb.contains(render_aabb_to_local * ray(t))) {
 		payload.origin = ray.o;
 		payload.alive = false;
@@ -1805,6 +1826,7 @@ std::vector<float> Testbed::Nerf::Training::get_extra_dims_cpu(int trainview) co
 }
 
 void Testbed::Nerf::Training::update_extra_dims() {
+	// 取出每个优化器的值，拷贝回device
 	uint32_t n_extra_dims = dataset.n_extra_dims();
 	std::vector<float> extra_dims_cpu(extra_dims_gpu.size());
 	for (uint32_t i = 0; i < extra_dims_opt.size(); ++i) {
@@ -1852,7 +1874,8 @@ void Testbed::render_nerf(
 	Lens lens = m_nerf.render_with_lens_distortion ? m_nerf.render_lens : Lens{};
 
 	auto resolution = render_buffer.resolution;
-
+	
+	// 由pixel得到ray,并且通过density_grid advance到物体表面得到t
 	tracer.init_rays_from_camera(
 		render_buffer.spp,
 		nerf_network->padded_output_width(),
@@ -2108,7 +2131,7 @@ void Testbed::Nerf::Training::update_transforms(int first, int last) {
 		auto xform = dataset.xforms[i + first];
 		float det_start = determinant(mat3(xform.start));
 		float det_end = determinant(mat3(xform.end));
-		if (distance(det_start, 1.0f) > 0.01f || distance(det_end, 1.0f) > 0.01f) {
+		if (distance(det_start, 1.0f) > 0.01f || distance(det_end, 1.0f) > 0.01f) { // 检查旋转矩阵行列式是否为1，否则强制归一化
 			tlog::warning() << "Rotation of camera matrix in frame " << i + first << " has a scaling component (determinant!=1).";
 			tlog::warning() << "Normalizing the matrix. This hints at an issue in your data generation pipeline and should be fixed.";
 
@@ -2270,6 +2293,8 @@ void Testbed::update_density_grid_nerf(float decay, uint32_t n_uniform_density_g
 
 	const uint32_t padded_output_width = m_nerf_network->padded_density_output_width();
 
+	// 输入density_grid_positions，density_grid_indices，从网络中获取相关输出mlp_out，而density_grid_tmp用于后续grids更新输出
+	// allocate_workspace_and_distribute 用于为神经网络的推理阶段分配工作空间，并将工作空间分布到不同设备上
 	GPUMemoryArena::Allocation alloc;
 	auto scratch = allocate_workspace_and_distribute<
 		NerfPosition,       // positions at which the NN will be queried for density evaluation
@@ -2297,29 +2322,31 @@ void Testbed::update_density_grid_nerf(float decay, uint32_t n_uniform_density_g
 				m_training_step == 0
 			);
 		} else {
-			CUDA_CHECK_THROW(cudaMemsetAsync(m_nerf.density_grid.data(), 0, sizeof(float)*n_elements, stream));
+			CUDA_CHECK_THROW(cudaMemsetAsync(m_nerf.density_grid.data(), 0, sizeof(float)*n_elements, stream)); // 将density_grid初始化为0
 		}
 	}
 
 	uint32_t n_steps = 1;
 	for (uint32_t i = 0; i < n_steps; ++i) {
-		CUDA_CHECK_THROW(cudaMemsetAsync(density_grid_tmp, 0, sizeof(float)*n_elements, stream));
-
+		CUDA_CHECK_THROW(cudaMemsetAsync(density_grid_tmp, 0, sizeof(float)*n_elements, stream)); // density_grid_tmp内存置0 
+		// 生成两次采样的 positions & indices
+		// 第一次对所有的grids采样，也就是均匀采样，因为对所有grids
+		// 第二次对非占grids采样，也就是非均匀采样，因为跳过占用grids
 		linear_kernel(generate_grid_samples_nerf_nonuniform, 0, stream,
-			n_uniform_density_grid_samples,
+			n_uniform_density_grid_samples, // 均匀采样
 			m_nerf.training.density_grid_rng,
 			m_nerf.density_grid_ema_step,
 			m_aabb,
 			m_nerf.density_grid.data(),
-			density_grid_positions,
+			density_grid_positions, // 随机修改pos和下面对应的indices
 			density_grid_indices,
 			m_nerf.max_cascade+1,
-			-0.01f
+			-0.01f // 对所有的grids
 		);
-		m_nerf.training.density_grid_rng.advance();
+		m_nerf.training.density_grid_rng.advance(); // 生成新的随机数?
 
 		linear_kernel(generate_grid_samples_nerf_nonuniform, 0, stream,
-			n_nonuniform_density_grid_samples,
+			n_nonuniform_density_grid_samples, // 非均匀采样
 			m_nerf.training.density_grid_rng,
 			m_nerf.density_grid_ema_step,
 			m_aabb,
@@ -2327,20 +2354,20 @@ void Testbed::update_density_grid_nerf(float decay, uint32_t n_uniform_density_g
 			density_grid_positions+n_uniform_density_grid_samples,
 			density_grid_indices+n_uniform_density_grid_samples,
 			m_nerf.max_cascade+1,
-			NERF_MIN_OPTICAL_THICKNESS()
+			NERF_MIN_OPTICAL_THICKNESS() // 0.01f，通过阈值设置，跳过被占用grids，不做sampling
 		);
 		m_nerf.training.density_grid_rng.advance();
 
 		// Evaluate density at the spawned locations in batches.
 		// Otherwise, we can exhaust the maximum index range of cutlass
-		size_t batch_size = NERF_GRID_N_CELLS() * 2;
+		size_t batch_size = NERF_GRID_N_CELLS() * 2; // 最大一次batch处理不超过两个grids
 
 		for (size_t i = 0; i < n_density_grid_samples; i += batch_size) {
 			batch_size = std::min(batch_size, n_density_grid_samples - i);
 
 			GPUMatrix<network_precision_t, RM> density_matrix(mlp_out + i, padded_output_width, batch_size);
 			GPUMatrix<float> density_grid_position_matrix((float*)(density_grid_positions + i), sizeof(NerfPosition)/sizeof(float), batch_size);
-			m_nerf_network->density(stream, density_grid_position_matrix, density_matrix, false);
+			m_nerf_network->density(stream, density_grid_position_matrix, density_matrix, false); // 网络推理，得到density
 		}
 
 		linear_kernel(splat_grid_samples_nerf_max_nearest_neighbor, 0, stream, n_density_grid_samples, density_grid_indices, mlp_out, density_grid_tmp, m_nerf.rgb_activation, m_nerf.density_activation);
@@ -2353,18 +2380,21 @@ void Testbed::update_density_grid_nerf(float decay, uint32_t n_uniform_density_g
 }
 
 void Testbed::update_density_grid_mean_and_bitfield(cudaStream_t stream) {
-	const uint32_t n_elements = NERF_GRID_N_CELLS();
+	const uint32_t n_elements = NERF_GRID_N_CELLS(); // 128*128*128
 
-	size_t size_including_mips = grid_mip_offset(NERF_CASCADES())/8;
+	size_t size_including_mips = grid_mip_offset(NERF_CASCADES())/8; // 所有girds数量(8*128*128*128) / 1字节表示8girds (8)
 	m_nerf.density_grid_bitfield.enlarge(size_including_mips);
 	m_nerf.density_grid_mean.enlarge(reduce_sum_workspace_size(n_elements));
 
-	CUDA_CHECK_THROW(cudaMemsetAsync(m_nerf.density_grid_mean.data(), 0, sizeof(float), stream));
+	CUDA_CHECK_THROW(cudaMemsetAsync(m_nerf.density_grid_mean.data(), 0, sizeof(float), stream)); //初始化置0
 	reduce_sum(m_nerf.density_grid.data(), [n_elements] __device__ (float val) { return fmaxf(val, 0.f) / (n_elements); }, m_nerf.density_grid_mean.data(), n_elements, stream);
 
 	linear_kernel(grid_to_bitfield, 0, stream, n_elements/8 * NERF_CASCADES(), n_elements/8 * (m_nerf.max_cascade + 1), m_nerf.density_grid.data(), m_nerf.density_grid_bitfield.data(), m_nerf.density_grid_mean.data());
 
 	for (uint32_t level = 1; level < NERF_CASCADES(); ++level) {
+		// n_elements/64表示level的个数
+		// n_elements/64的理解: 64=8*8，其中
+		// 8: 一次处理了8个grids
 		linear_kernel(bitfield_max_pool, 0, stream, n_elements/64, m_nerf.get_density_grid_bitfield_mip(level-1), m_nerf.get_density_grid_bitfield_mip(level));
 	}
 
@@ -2372,19 +2402,24 @@ void Testbed::update_density_grid_mean_and_bitfield(cudaStream_t stream) {
 }
 
 __global__ void mark_density_grid_in_sphere_empty_kernel(const uint32_t n_elements, float* density_grid, vec3 pos, float radius) {
-	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x; // 遍历所有levels的grids
 	if (i >= n_elements) return;
 
 	// Random position within that cellq
 	uint32_t level = i / NERF_GRID_N_CELLS();
-	uint32_t pos_idx = i % NERF_GRID_N_CELLS();
+	uint32_t pos_idx = i % NERF_GRID_N_CELLS(); // 当前level下的index
 
+	// 单位为grid，坐标原点在cube左下角，非负
 	uint32_t x = morton3D_invert(pos_idx>>0);
 	uint32_t y = morton3D_invert(pos_idx>>1);
 	uint32_t z = morton3D_invert(pos_idx>>2);
 
+	// sqrt(3)*2^{level}/128 = 当前level下grids cell大小
 	float cell_radius = scalbnf(SQRT3(), level) / NERF_GRIDSIZE();
 	vec3 cell_pos = ((vec3{(float)x+0.5f, (float)y+0.5f, (float)z+0.5f}) / (float)NERF_GRIDSIZE() - 0.5f) * scalbnf(1.0f, level) + 0.5f;
+	// ((vec3{(float)x+0.5f, (float)y+0.5f, (float)z+0.5f}) / (float)NERF_GRIDSIZE() - vec3(0.5f)) in [-1,1]
+	// * scalbnf(1.0f, level) 换算到当前level下的绝对坐标 in [-2^{level},2^{level}]
+	// + vec3(0.5f) 恢复坐标原点
 
 	// Disable if the cell touches the sphere (conservatively, by bounding the cell with a sphere)
 	if (distance(pos, cell_pos) < radius + cell_radius) {
@@ -2570,6 +2605,7 @@ void Testbed::train_nerf(uint32_t target_batch_size, bool get_loss_scalar, cudaS
 	m_nerf.training.n_steps_since_cam_update += 1;
 
 	if (train_extra_dims) {
+		// 把extra_dims_gradient从device拷贝到host，混合精度训练除LOSS_SCALE，然后每张图片优化
 		std::vector<float> extra_dims_gradient(m_nerf.training.extra_dims_gradient_gpu.size());
 		m_nerf.training.extra_dims_gradient_gpu.copy_to_host(extra_dims_gradient);
 
@@ -2929,10 +2965,13 @@ void Testbed::training_prep_nerf(uint32_t batch_size, cudaStream_t stream) {
 
 	float alpha = m_nerf.training.density_grid_decay;
 	uint32_t n_cascades = m_nerf.max_cascade+1;
-
+	
+	// 根据训练迭代次数，分两种不同的策略sampling，实现上和论文E.2略有出入
 	if (m_training_step < 256) {
+		// 所有grids都做均匀采样
 		update_density_grid_nerf(alpha, NERF_GRID_N_CELLS() * n_cascades, 0, stream);
 	} else {
+		// 只有一半的grids做采样，且其中：1/4均匀采样，1/4非均匀采样
 		update_density_grid_nerf(alpha, NERF_GRID_N_CELLS() / 4 * n_cascades, NERF_GRID_N_CELLS() / 4 * n_cascades, stream);
 	}
 }
@@ -3033,6 +3072,7 @@ GPUMemory<float> Testbed::get_density_on_grid(ivec3 res3d, const BoundingBox& aa
 	NerfPosition* positions = std::get<0>(scratch);
 	network_precision_t* mlp_out = std::get<1>(scratch);
 
+	// 划分到多线程中，一个block的大小为16x8x1
 	const dim3 threads = { 16, 8, 1 };
 	const dim3 blocks = { div_round_up((uint32_t)res3d.x, threads.x), div_round_up((uint32_t)res3d.y, threads.y), div_round_up((uint32_t)res3d.z, threads.z) };
 
@@ -3155,6 +3195,7 @@ void Testbed::Nerf::reset_extra_dims(default_rng_t& rng) {
 	uint32_t n_extra_dims = training.dataset.n_extra_dims();
 	std::vector<float> extra_dims_cpu(n_extra_dims * (training.dataset.n_images + 1)); // n_images + 1 since we use an extra 'slot' for the inference latent code
 	float* dst = extra_dims_cpu.data();
+	// 每张图片对应一个优化器，每个优化器维度为n_extra_dims，如果没有指定light_dirs，随机初始化
 	training.extra_dims_opt = std::vector<VarAdamOptimizer>(training.dataset.n_images, VarAdamOptimizer(n_extra_dims, 1e-4f));
 	for (uint32_t i = 0; i < training.dataset.n_images; ++i) {
 		vec3 light_dir = warp_direction(normalize(training.dataset.metadata[i].light_dir));

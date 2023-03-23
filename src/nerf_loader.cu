@@ -302,7 +302,7 @@ NerfDataset load_nerf(const std::vector<fs::path>& jsonpaths, float sharpen_amou
 	if (transforms["camera"].is_array()) {
 		throw std::runtime_error{"hdf5 is no longer supported. please use the hdf52nerf.py conversion script"};
 	}
-
+	// 允许读取多份json，多个colmap数据如果align到统一坐标系下就可以一起用?
 	// nerf original format
 	std::vector<nlohmann::json> jsons;
 	std::transform(
@@ -419,6 +419,7 @@ NerfDataset load_nerf(const std::vector<fs::path>& jsonpaths, float sharpen_amou
 	bool enable_depth_loading = true;
 	std::atomic<int> n_loaded{0};
 	BoundingBox cam_aabb;
+	// support read multi-json file
 	for (size_t i = 0; i < jsons.size(); ++i) {
 		auto& json = jsons[i];
 
@@ -500,15 +501,17 @@ NerfDataset load_nerf(const std::vector<fs::path>& jsonpaths, float sharpen_amou
 				vec3{float(json["offset"][0]), float(json["offset"][1]), float(json["offset"][2])} :
 				vec3{float(json["offset"]), float(json["offset"]), float(json["offset"])};
 		}
-
+		// TODO: test
 		if (json.contains("aabb")) {
 			// map the given aabb of the form [[minx,miny,minz],[maxx,maxy,maxz]] via an isotropic scale and translate to fit in the (0,0,0)-(1,1,1) cube, with the given center at 0.5,0.5,0.5
 			const auto& aabb=json["aabb"];
+			// 求xyz三个轴向上的最长尺度
 			float length = std::max(0.000001f,std::max(std::max(std::abs(float(aabb[1][0])-float(aabb[0][0])),std::abs(float(aabb[1][1])-float(aabb[0][1]))),std::abs(float(aabb[1][2])-float(aabb[0][2]))));
 			result.scale = 1.f/length;
+			// 用最大的尺度压缩各个轴向，至最大轴向压缩为1
 			result.offset = { ((float(aabb[1][0])+float(aabb[0][0]))*0.5f)*-result.scale + 0.5f , ((float(aabb[1][1])+float(aabb[0][1]))*0.5f)*-result.scale + 0.5f,((float(aabb[1][2])+float(aabb[0][2]))*0.5f)*-result.scale + 0.5f};
 		}
-
+		// 通过transform_matrix_start & transform_matrix_end可以通过脚本控制aabb
 		if (json.contains("frames") && json["frames"].is_array()) {
 			for (int j = 0; j < json["frames"].size(); ++j) {
 				auto& frame = json["frames"][j];
@@ -542,7 +545,7 @@ NerfDataset load_nerf(const std::vector<fs::path>& jsonpaths, float sharpen_amou
 			}
 		}
 
-
+		// 并行读取frames数据
 		if (json.contains("frames") && json["frames"].is_array()) pool.parallel_for_async<size_t>(0, json["frames"].size(), [&progress, &n_loaded, &result, &images, &json, &resolve_path, &supported_image_formats, base_path, image_idx, info, rolling_shutter, principal_point, lens, part_after_underscore, fix_premult, enable_depth_loading, enable_ray_loading](size_t i) {
 			size_t i_img = i + image_idx;
 			auto& frame = json["frames"][i];
@@ -573,7 +576,7 @@ NerfDataset load_nerf(const std::vector<fs::path>& jsonpaths, float sharpen_amou
 				if (!img) {
 					throw std::runtime_error{"Could not open image file: "s + std::string{stbi_failure_reason()}};
 				}
-
+				// load alpha image, 真正的alpha通道
 				fs::path alphapath = resolve_path(base_path, fmt::format("{}.alpha.{}", frame["file_path"], path.extension()));
 				if (alphapath.exists()) {
 					int wa = 0, ha = 0;
@@ -592,7 +595,7 @@ NerfDataset load_nerf(const std::vector<fs::path>& jsonpaths, float sharpen_amou
 						img[i*4+3] = (uint8_t)(255.0f*srgb_to_linear(alpha_img[i*4]*(1.f/255.f))); // copy red channel of alpha to alpha.png to our alpha channel
 					}
 				}
-
+				// load mask image，
 				fs::path maskpath = path.parent_path() / fmt::format("dynamic_mask_{}.png", path.basename());
 				if (maskpath.exists()) {
 					int wa = 0, ha = 0;
@@ -608,6 +611,7 @@ NerfDataset load_nerf(const std::vector<fs::path>& jsonpaths, float sharpen_amou
 
 					dst.mask_color = 0x00FF00FF; // HOT PINK
 					for (int i = 0; i < product(dst.res); ++i) {
+						// mask image任意前三个通道不为0，则mask
 						if (mask_img[i*4] != 0 || mask_img[i*4+1] != 0 || mask_img[i*4+2] != 0) {
 							*(uint32_t*)&img[i*4] = dst.mask_color;
 						}
@@ -664,6 +668,7 @@ NerfDataset load_nerf(const std::vector<fs::path>& jsonpaths, float sharpen_amou
 			nlohmann::json& jsonmatrix_start = frame.contains("transform_matrix_start") ? frame["transform_matrix_start"] : frame["transform_matrix"];
 			nlohmann::json& jsonmatrix_end = frame.contains("transform_matrix_end") ? frame["transform_matrix_end"] : jsonmatrix_start;
 
+			// 指定光源方向，n_extra_learnable_dims置0，不再学习光照
 			if (frame.contains("driver_parameters")) {
 				vec3 light_dir{
 					frame["driver_parameters"].value("LightX", 0.f),

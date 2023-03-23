@@ -187,6 +187,9 @@ struct NerfCoordinate {
 		*this = inp;
 		copy_extra_dims(inp.get_extra_dims(), stride_in_bytes);
 	}
+	// 在NerfCoordinate后加入extra_dims，
+	// 内存排布为 NerfCoordinate[pos(3*float),dt(1*float),dir(3*float)]+extra_dims[(extra_dims*float)]
+	// stride_in_bytes=m_nerf_network->n_extra_dims() * sizeof(float)
 	NGP_HOST_DEVICE inline void copy_extra_dims(const float *extra_dims, uint32_t stride_in_bytes) {
 		if (stride_in_bytes >= sizeof(NerfCoordinate)) {
 			float* dst = get_extra_dims();
@@ -441,8 +444,11 @@ inline NGP_HOST_DEVICE float advance_to_next_voxel(float t, float cone_angle, co
 
 inline NGP_HOST_DEVICE uint32_t mip_from_pos(const vec3& pos, uint32_t max_cascade = NERF_CASCADES()-1) {
 	int exponent;
+	// pose相对cube中心点的xyz方向上最大值
 	float maxval = max(abs(pos - 0.5f));
+	// maxval=2^exponent
 	frexpf(maxval, &exponent);
+	// 避免越界
 	return (uint32_t)clamp(exponent+1, 0, (int)max_cascade);
 }
 

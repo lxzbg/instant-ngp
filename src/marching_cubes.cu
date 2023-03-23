@@ -40,6 +40,7 @@ namespace ngp {
 ivec3 get_marching_cubes_res(uint32_t res_1d, const BoundingBox &aabb) {
 	float scale = res_1d / max(aabb.max - aabb.min);
 	ivec3 res3d = (aabb.max - aabb.min) * scale + 0.5f;
+	// 取16的整数倍，基于内存考虑?
 	res3d.x = next_multiple((unsigned int)res3d.x, 16u);
 	res3d.y = next_multiple((unsigned int)res3d.y, 16u);
 	res3d.z = next_multiple((unsigned int)res3d.z, 16u);

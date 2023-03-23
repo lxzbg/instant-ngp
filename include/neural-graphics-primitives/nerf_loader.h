@@ -80,7 +80,7 @@ struct NerfDataset {
 	bool has_rays = false;
 
 	uint32_t n_extra_learnable_dims = 0;
-	bool has_light_dirs = false;
+	bool has_light_dirs = false; // ?
 
 	uint32_t n_extra_dims() const {
 		return (has_light_dirs ? 3u : 0u) + n_extra_learnable_dims;
@@ -100,8 +100,9 @@ struct NerfDataset {
 
 	mat4x3 nerf_matrix_to_ngp(const mat4x3& nerf_matrix, bool scale_columns = false) const {
 		mat4x3 result = nerf_matrix;
+		// flip the sign of the y-axis (from down to up) and z-axis (from forwards to backwards)
 		result[0] *= scale_columns ? scale : 1.f;
-		result[1] *= scale_columns ? -scale : -1.f;
+		result[1] *= scale_columns ? -scale : -1.f; // 
 		result[2] *= scale_columns ? -scale : -1.f;
 		result[3] = result[3] * scale + offset;
 
@@ -110,15 +111,19 @@ struct NerfDataset {
 			result[2] *= -1.0f;
 		} else {
 			// Cycle axes xyz<-yzx
+			// rotate x -90, rotate z -90,
 			vec4 tmp = row(result, 0);
-			result = row(result, 0, row(result, 1));
-			result = row(result, 1, row(result, 2));
-			result = row(result, 2, tmp);
+			result = row(result, 0, row(result, 1)); // y->x
+			result = row(result, 1, row(result, 2)); // z->y
+			result = row(result, 2, tmp); // x->z
 		}
 
 		return result;
 	}
-
+[  0.7071068, -0.7071068,  0.0000000;
+   0.5000000,  0.5000000, -0.7071068;
+   0.5000000,  0.5000000,  0.7071068 ]
+	 
 	mat4x3 ngp_matrix_to_nerf(const mat4x3& ngp_matrix, bool scale_columns = false) const {
 		mat4x3 result = ngp_matrix;
 		if (from_mitsuba) {
@@ -155,7 +160,7 @@ struct NerfDataset {
 		if (scale_direction) {
 			ray.d *= scale;
 		}
-
+		// xyz->yzx
 		float tmp = ray.o[0];
 		ray.o[0] = ray.o[1];
 		ray.o[1] = ray.o[2];
